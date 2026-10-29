@@ -91,8 +91,9 @@ fieldset.grp legend{font:600 11px var(--font-m);letter-spacing:.16em;text-transf
 /* board */
 .boardwrap{position:relative}
 .board{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));aspect-ratio:1;border-radius:6px;overflow:hidden;
-  box-shadow:0 0 0 2px var(--line),0 22px 44px -26px rgba(6,12,22,.55);touch-action:none;user-select:none;-webkit-user-select:none}
-.sq{position:relative;display:block;border:0;padding:0;margin:0;min-width:0;background:var(--sq-l);isolation:isolate;cursor:default;font:inherit}
+  box-shadow:0 0 0 2px var(--line),0 22px 44px -26px rgba(6,12,22,.55);user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+.sq{position:relative;display:block;border:0;padding:0;margin:0;min-width:0;background:var(--sq-l);isolation:isolate;cursor:default;font:inherit;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+.sq.own{touch-action:none;cursor:grab}
 .sq.dk{background:var(--sq-d)}
 button.sq:focus-visible{outline:3px solid var(--accent);outline-offset:-3px;z-index:5}
 .pc{position:absolute;inset:5%;z-index:1;pointer-events:none}
@@ -147,6 +148,7 @@ button.sq:focus-visible{outline:3px solid var(--accent);outline-offset:-3px;z-in
 .moves p{margin:0;font-family:var(--font-b);font-size:13.5px}
 .mv{display:grid;grid-template-columns:34px 1fr 1fr;gap:6px;padding:2px 0}
 .mv .mn{color:var(--muted)}
+.mv .cur{color:var(--accent);font-weight:600}
 .btns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
 .tips{font-size:12.5px;color:var(--muted);margin:0}
 
@@ -488,7 +490,10 @@ function order(ms){
   for (const m of ms) m.sc = (m.cap ? 10 * VAL[m.cap[1]] - VAL[m.p[1]] / 10 : 0) + (m.pr ? 800 : 0);
   ms.sort((a, b) => b.sc - a.sc);
 }
+let DEADLINE = Infinity, NODES = 0;
+const ABORT = {aborted: true};
 function nega(s, d, a, b, v, ply){
+  if ((++NODES & 1023) === 0 && Date.now() > DEADLINE) throw ABORT;
   const us = s.t;
   if ((v === 'atomic' || v === 'fog') && s.b.indexOf(us + 'K') < 0) return -MATE + ply;
   if (v === 'koth'){
@@ -512,21 +517,40 @@ function nega(s, d, a, b, v, ply){
   }
   return best;
 }
-function bestMove(s, v, level){
-  const depth = level === 'casual' ? 2 : level === 'club' ? 3 : 5;
+function posKey(s){ return s.b.map(x => x || '..').join('') + s.t + s.c; }
+// Iterative deepening with a time budget, so the page never freezes for long.
+// `seen` maps position keys to how often they occurred in the game (repetition = draw).
+function bestMove(s, v, level, seen){
+  const maxDepth = level === 'casual' ? 2 : level === 'club' ? 3 : 5;
   const noise = level === 'casual' ? 90 : level === 'club' ? 14 : 0;
+  const budget = level === 'casual' ? 400 : level === 'club' ? 900 : 1600;
   const ms = legal(s, v);
   if (!ms.length) return null;
   for (let i = ms.length - 1; i > 0; i--){ const j = (Math.random() * (i + 1)) | 0; [ms[i], ms[j]] = [ms[j], ms[i]]; }
   order(ms);
-  let best = null, bs = -Infinity;
-  for (const m of ms){
+  const kids = ms.map(m => {
     const ns = apply(s, m, v);
-    let sc;
-    if (noise) sc = -nega(ns, depth - 1, -Infinity, Infinity, v, 1) + Math.random() * noise;
-    else sc = -nega(ns, depth - 1, -Infinity, -bs, v, 1);
-    if (sc > bs){ bs = sc; best = m; }
-  }
+    return {m, ns, rep: seen ? (seen.get(posKey(ns)) || 0) : 0, jit: Math.random() * noise, sc: 0};
+  });
+  let best = kids[0].m;
+  DEADLINE = Date.now() + budget; NODES = 0;
+  try {
+    for (let d = 1; d <= maxDepth; d++){
+      let bs = -Infinity, bm = null;
+      for (const k of kids){
+        let sc;
+        if (k.rep >= 2) sc = 0;
+        else if (noise) sc = -nega(k.ns, d - 1, -Infinity, Infinity, v, 1) + k.jit;
+        else sc = -nega(k.ns, d - 1, -Infinity, -bs, v, 1);
+        k.sc = sc;
+        if (sc > bs){ bs = sc; bm = k.m; }
+      }
+      best = bm;
+      kids.sort((a, b) => b.sc - a.sc);
+      if (bs >= MATE - 100) break;
+    }
+  } catch (e) { if (e !== ABORT) throw e; }
+  finally { DEADLINE = Infinity; }
   return best;
 }
 // ==ENGINE END==
@@ -580,15 +604,22 @@ function saveSettings(){ try { localStorage.setItem('rbc.settings', JSON.stringi
 
 let sound = true, ac = null;
 function blip(freq, dur){
-  if (!sound) return;
+  if (!sound || !ac || ac.state !== 'running') return;
   try {
-    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
     const o = ac.createOscillator(), g = ac.createGain();
     o.type = 'triangle'; o.frequency.value = freq; g.gain.value = 0.05;
     o.connect(g); g.connect(ac.destination); o.start();
     g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur); o.stop(ac.currentTime + dur);
   } catch (e) {}
 }
+// Browsers only allow audio after a tap or click, so create/resume the audio context on the first one.
+window.addEventListener('pointerdown', () => {
+  if (!sound) return;
+  try {
+    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+    if (ac.state === 'suspended') ac.resume();
+  } catch (e) {}
+}, true);
 $('soundBtn').addEventListener('click', () => {
   sound = !sound;
   $('soundBtn').textContent = sound ? 'Sound on' : 'Sound off';
@@ -627,6 +658,7 @@ function paintBoard(B, cfg){
     const tg = cfg.targets && cfg.targets.get(id);
     if (tg) cls += tg === 'cap' ? ' tcap' : ' tmove';
     if (cfg.checkSq === id) cls += ' chk';
+    if (cfg.own && p && p[0] === cfg.own) cls += ' own';
     if (cfg.extra && cfg.extra[id]) cls += ' ' + cfg.extra[id];
     if (o.cls !== cls){ o.el.className = cls; o.cls = cls; }
     const key = p || '';
@@ -667,7 +699,6 @@ $('setupForm').addEventListener('submit', e => { e.preventDefault(); startGame()
 /* ---- game state ---- */
 let B = null, G = null, overlayKey = '', press = null, drag = null;
 
-function posKey(s){ return s.b.map(x => x || '..').join('') + s.t + s.c; }
 function showSetup(){ G = null; $('game').hidden = true; $('setup').hidden = false; paintPreview(); }
 
 function startGame(){
@@ -714,7 +745,10 @@ function renderMoves(){
   if (!G.hist.length){ el.innerHTML = '<p class="muted">No moves yet.</p>'; return; }
   let h = '';
   for (let i = 0; i < G.hist.length; i += 2)
-    h += `<div class="mv"><span class="mn">${i / 2 + 1}.</span><span>${G.hist[i].san}</span><span>${G.hist[i + 1] ? G.hist[i + 1].san : ''}</span></div>`;
+  {
+    const n = G.hist.length, cur = j => j === n - 1 ? ' class="cur"' : '';
+    h += `<div class="mv"><span class="mn">${i / 2 + 1}.</span><span${cur(i)}>${G.hist[i].san}</span><span${cur(i + 1)}>${G.hist[i + 1] ? G.hist[i + 1].san : ''}</span></div>`;
+  }
   el.innerHTML = h; el.scrollTop = el.scrollHeight;
 }
 function overlayHTML(){
@@ -745,7 +779,7 @@ function render(){
     for (const m of G.legal) if (m.f === G.sel) targets.set(m.t, (m.cap || m.ep) ? 'cap' : 'mv');
   }
   const chk = v !== 'fog' && inCheck(G.s, G.s.t, v);
-  paintBoard(B, {s: G.s, fogSet, last, sel: G.sel, targets, checkSq: chk && (!over || G.over.reason === 'Checkmate') ? G.s.b.indexOf(G.s.t + 'K') : -1});
+  paintBoard(B, {s: G.s, fogSet, last, sel: G.sel, targets, own: canAct() ? G.s.t : null, checkSq: chk && (!over || G.over.reason === 'Checkmate') ? G.s.b.indexOf(G.s.t + 'K') : -1});
 
   const bottom = G.flipped ? 'b' : 'w', lost = lostPieces();
   renderStrip($('stripTop'), other(bottom), lost);
@@ -765,8 +799,9 @@ function render(){
   renderMoves();
 
   $('undoBtn').disabled = G.thinking || !G.hist.length;
-  $('resignBtn').disabled = over || G.thinking;
-  $('resignBtn').textContent = G.resignArm ? 'Tap again to resign' : 'Resign';
+  $('resignBtn').disabled = !over && G.thinking;
+  $('resignBtn').textContent = over ? 'Play again' : G.resignArm ? 'Tap again to resign' : 'Resign';
+  $('resignBtn').classList.toggle('pri', over);
 
   const ov = overlayHTML(), ovEl = $('overlay');
   if (!ov){ ovEl.hidden = true; overlayKey = ''; }
@@ -816,7 +851,9 @@ function maybeAI(){
   setTimeout(() => {
     if (!G || G.id !== id) return;
     let m = null;
-    try { m = bestMove(G.s, G.v, G.level); } catch (err) { console.error(err); }
+    const seen = new Map();
+    for (const k of G.keys) seen.set(k, (seen.get(k) || 0) + 1);
+    try { m = bestMove(G.s, G.v, G.level, seen); } catch (err) { console.error(err); }
     G.thinking = false;
     if (m && !G.over) doMove(m); else render();
   }, 90);
@@ -910,11 +947,15 @@ $('overlay').addEventListener('click', e => {
 $('flipBtn').addEventListener('click', () => { G.flipped = !G.flipped; B = buildBoard($('board'), G.flipped, true); render(); });
 $('newBtn').addEventListener('click', showSetup);
 $('undoBtn').addEventListener('click', () => {
-  if (!G.hist.length || G.thinking) return;
+  if (G.thinking) return;
+  // Undoing a resignation takes back the resignation only, not any moves.
+  if (G.over && G.over.reason === 'Resignation'){ G.over = null; G.hideOver = false; render(); maybeAI(); return; }
+  if (!G.hist.length) return;
   const cur = () => G.hist.length ? G.hist[G.hist.length - 1].after : G.s0;
   if (G.mode === 'ai'){ do { G.hist.pop(); } while (G.hist.length && cur().t !== G.human); }
   else G.hist.pop();
   G.s = cur(); G.over = null; G.hideOver = false; G.sel = null; G.promo = null; G.curtain = '';
+  if (G.v === 'fog' && G.mode === '2p' && G.flipped !== (G.s.t === 'b')){ G.flipped = G.s.t === 'b'; B = buildBoard($('board'), G.flipped, true); }
   G.legal = legal(G.s, G.v);
   G.keys = [posKey(G.s0)].concat(G.hist.map(h => h.key));
   const lh = G.hist[G.hist.length - 1];
@@ -922,7 +963,7 @@ $('undoBtn').addEventListener('click', () => {
   render(); maybeAI();
 });
 $('resignBtn').addEventListener('click', () => {
-  if (G.over) return;
+  if (G.over){ startGame(); return; }
   if (!G.resignArm){ G.resignArm = true; render(); const id = G.id; setTimeout(() => { if (G && G.id === id && G.resignArm){ G.resignArm = false; render(); } }, 3000); return; }
   const loser = G.mode === 'ai' ? G.human : G.s.t;
   G.over = {winner: other(loser), reason: 'Resignation'}; G.resignArm = false; G.curtain = ''; render();
